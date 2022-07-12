@@ -16,6 +16,8 @@ namespace scavenge_tester
         private const int NumStreams = 1000;
         private const int MaxEvents = 100;
         private const int DataSize = 5000;
+        private static string[] Streams;
+        private static StreamInfo[] StreamInfos;
 
         private enum DeletionKind
         {
@@ -37,18 +39,38 @@ namespace scavenge_tester
 
         private static Random Random = new Random();
 
-        static async Task Main(string[] args)
+        static async Task Main()
         {
-            var streamInfos = new StreamInfo[NumStreams];
+            Streams = new string[NumStreams];
+            StreamInfos = new StreamInfo[NumStreams];
+
+            for (int i = 0; i < NumStreams; i++)
+                Streams[i] = GenStreamName();
+
+            while (true) {
+                await StartNewRound();
+            }
+        }
+
+        static async Task StartNewRound()
+        {
+            Console.WriteLine("Starting new round!");
+            var eventsAdded = new int[NumStreams];
+            var deletionApplied = new bool[NumStreams];
+
             var rem = new List<int>();
             for (int i = 0; i < NumStreams; i++)
             {
-                streamInfos[i] = GenStreamInfo();
-                rem.Add(i);
+                var numExistingEvents = StreamInfos[i]?.NumEvents ?? 0;
+                eventsAdded[i] = numExistingEvents;
+
+                var newStreamInfo = GenStreamInfo(Streams[i], numExistingEvents, StreamInfos[i]?.DeletionKind == DeletionKind.TombStone);
+                if (newStreamInfo != null){
+                    StreamInfos[i] = newStreamInfo;
+                    rem.Add(i);
+                }
             }
 
-            var deletionApplied = new bool[NumStreams];
-            var eventsAdded = new int[NumStreams];
 
             using (var c = EventStoreConnection.Create("ConnectTo=tcp://admin:changeit@127.0.0.1:1113;UseSslConnection=false"))
             {
@@ -57,7 +79,7 @@ namespace scavenge_tester
                 while (rem.Count > 0)
                 {
                     var cur = rem[Random.Next(rem.Count)];
-                    var streamInfo = streamInfos[cur];
+                    var streamInfo = StreamInfos[cur];
 
                     if (!deletionApplied[cur] && eventsAdded[cur] >= streamInfo.MinDeletionPoint)
                     {
@@ -148,68 +170,61 @@ namespace scavenge_tester
                 var lastChunkStartPos = new Position(lastChunkNumber * ChunkSize, lastChunkNumber * ChunkSize);
                 var foundLastEvent = new HashSet<string>();
                 Console.WriteLine("Starting $all verification");
-                while (true)
+                Position pos = Position.Start;
+                AllEventsSlice readAllResult;
+                do
                 {
-                    Position pos = Position.Start;
-                    AllEventsSlice result;
-                    do
+                    readAllResult = await c.ReadAllEventsForwardAsync(pos, 1024, false);
+                    foreach (var evt in readAllResult.Events)
                     {
-                        //Console.WriteLine($"Reading log at position: {pos}");
-                        result = await c.ReadAllEventsForwardAsync(pos, 1024, false);
-                        foreach (var evt in result.Events)
+                        var stream = evt.OriginalStreamId;
+                        var evtNumber = evt.OriginalEventNumber;
+
+                        var streamInfo = StreamInfos.FirstOrDefault(x => x.Stream == stream);
+                        if (streamInfo is null)
                         {
-                            var stream = evt.OriginalStreamId;
-                            var evtNumber = evt.OriginalEventNumber;
-
-                            var streamInfo = streamInfos.FirstOrDefault(x => x.Stream == stream);
-                            if (streamInfo is null)
-                            {
-                                // uncomment for strict checking (but will not allow multiple runs of the tool on same database):
-                                //if (!stream.StartsWith("$"))
-                                   // throw new Exception($"Could not find stream info for: {stream}");
-                                continue;
-                            }
-
-                            if (evtNumber == streamInfo.NumEvents - 1 || evtNumber == long.MaxValue) // last event is always preserved
-                            {
-                                foundLastEvent.Add(stream);
-                                continue;
-                            }
-
-                            if (evt.OriginalPosition >= lastChunkStartPos) // do not check events in the last chunk
-                                continue;
-
-                            Verify(evt, streamInfo, scavengePointTime);
+                            if (!stream.StartsWith("$"))
+                                throw new Exception($"Could not find stream info for: {stream}");
+                            continue;
                         }
-                        pos = result.NextPosition;
-                    } while (!result.IsEndOfStream);
 
-                    foreach (var streamInfo in streamInfos)
-                        if (!foundLastEvent.Contains(streamInfo.Stream))
-                            Console.WriteLine(
-                                $"ERROR: Last event not found for stream: {streamInfo.Stream}");
-
-                    Console.WriteLine("Starting stream verification");
-                    foreach (var streamInfo in streamInfos)
-                    {
-                        long nextEventNumber = 0;
-                        while (true)
+                        if (evtNumber == streamInfo.NumEvents - 1 || evtNumber == long.MaxValue) // last event is always preserved
                         {
-                            var readResult = await c.ReadStreamEventsForwardAsync(streamInfo.Stream, nextEventNumber, 1024, false);
-                            foreach (var evt in readResult.Events)
-                                Verify(evt, streamInfo, scavengePointTime);
-
-                            nextEventNumber = readResult.NextEventNumber;
-                            if (readResult.IsEndOfStream)
-                                break;
+                            foundLastEvent.Add(stream);
+                            continue;
                         }
+
+                        if (evt.OriginalPosition >= lastChunkStartPos) // do not check events in the last chunk
+                            continue;
+
+                        Verify(evt, streamInfo, scavengePointTime);
                     }
+                    pos = readAllResult.NextPosition;
+                } while (!readAllResult.IsEndOfStream);
 
-                    Console.WriteLine("Verification complete!");
-                    Console.ReadLine();
+                foreach (var streamInfo in StreamInfos)
+                    if (!foundLastEvent.Contains(streamInfo.Stream))
+                        Console.WriteLine(
+                            $"ERROR: Last event not found for stream: {streamInfo.Stream}");
+
+                Console.WriteLine("Starting stream verification");
+                foreach (var streamInfo in StreamInfos)
+                {
+                    long nextEventNumber = 0;
+                    while (true)
+                    {
+                        var readStreamResult = await c.ReadStreamEventsForwardAsync(streamInfo.Stream, nextEventNumber, 1024, false);
+                        foreach (var evt in readStreamResult.Events)
+                            Verify(evt, streamInfo, scavengePointTime);
+
+                        nextEventNumber = readStreamResult.NextEventNumber;
+                        if (readStreamResult.IsEndOfStream)
+                            break;
+                    }
                 }
 
-
+                Console.WriteLine("Verification complete!");
+                Console.ReadLine();
             }
         }
 
@@ -223,27 +238,27 @@ namespace scavenge_tester
                 case DeletionKind.TruncateBefore:
                     if (evtNumber < streamInfo.DeletionData)
                         Console.WriteLine(
-                            $"ERROR: Found event: {evtNumber} for stream: {stream} but truncate before is: {streamInfo.DeletionData}");
+                            $"ERROR: Found event: {evtNumber} for stream: {stream} at C:{evt.OriginalPosition.Value.CommitPosition}/P:{evt.OriginalPosition.Value.PreparePosition} but truncate before is: {streamInfo.DeletionData}");
                     break;
                 case DeletionKind.MaxCount:
                     if (evtNumber < streamInfo.NumEvents - streamInfo.DeletionData)
                         Console.WriteLine(
-                            $"ERROR: Found event: {evtNumber} for stream: {stream} but max count is: {streamInfo.DeletionData} and number of events is: {streamInfo.NumEvents}");
+                            $"ERROR: Found event: {evtNumber} for stream: {stream} at C:{evt.OriginalPosition.Value.CommitPosition}/P:{evt.OriginalPosition.Value.PreparePosition} but max count is: {streamInfo.DeletionData} and number of events is: {streamInfo.NumEvents}");
                     break;
                 case DeletionKind.MaxAge:
                     if (evt.Event.Created + TimeSpan.FromSeconds(streamInfo.DeletionData) <
                         scavengePointTime)
                         Console.WriteLine(
-                            $"ERROR: Found event: {evtNumber} for stream: {stream} but max age is: {TimeSpan.FromSeconds(streamInfo.DeletionData)}, event created date is: {evt.Event.Created} and scavenge point is: {scavengePointTime}");
+                            $"ERROR: Found event: {evtNumber} for stream: {stream} at C:{evt.OriginalPosition.Value.CommitPosition}/P:{evt.OriginalPosition.Value.PreparePosition} but max age is: {TimeSpan.FromSeconds(streamInfo.DeletionData)}, event created date is: {evt.Event.Created} and scavenge point is: {scavengePointTime}");
                     break;
                 case DeletionKind.SoftDelete:
                     if (evtNumber < streamInfo.DeletionData)
                         Console.WriteLine(
-                            $"ERROR: Found event: {evtNumber} for stream: {stream} but stream was soft deleted at: {streamInfo.DeletionData}");
+                            $"ERROR: Found event: {evtNumber} for stream: {stream} at C:{evt.OriginalPosition.Value.CommitPosition}/P:{evt.OriginalPosition.Value.PreparePosition} but stream was soft deleted at: {streamInfo.DeletionData}");
                     break;
                 case DeletionKind.TombStone:
                     Console.WriteLine(
-                        $"ERROR: Found event: {evtNumber} for stream: {stream} but stream was tombstoned");
+                        $"ERROR: Found event: {evtNumber} for stream: {stream} at C:{evt.OriginalPosition.Value.CommitPosition}/P:{evt.OriginalPosition.Value.PreparePosition} but stream was tombstoned");
                     break;
                 default:
                     throw new ArgumentOutOfRangeException();
@@ -293,9 +308,9 @@ namespace scavenge_tester
         }
 
         private static HashSet<string> UsedNames = new HashSet<string>();
-        private static StreamInfo GenStreamInfo()
-        {
 
+        private static string GenStreamName()
+        {
             string stream;
             while (true)
             {
@@ -304,28 +319,40 @@ namespace scavenge_tester
                 UsedNames.Add(stream);
                 break;
             }
+            return stream;
+        }
+
+        private static StreamInfo GenStreamInfo(string stream, int numExistingEvents, bool isTombstoned)
+        {
+            if (isTombstoned)
+                return default(StreamInfo);
 
             var streamInfo = new StreamInfo();
             streamInfo.Stream = stream;
-            streamInfo.NumEvents = Random.Next(1, MaxEvents + 1);
-            streamInfo.MinDeletionPoint = Random.Next(0, streamInfo.NumEvents + 1);
+            streamInfo.NumEvents = numExistingEvents + Random.Next(1, MaxEvents + 1);
+            streamInfo.MinDeletionPoint = Random.Next(numExistingEvents, streamInfo.NumEvents + 1);
             streamInfo.DeletionKind = (DeletionKind) Random.Next(5);
             switch (streamInfo.DeletionKind)
             {
                 case DeletionKind.TruncateBefore:
-                    streamInfo.DeletionData = Random.Next(0, streamInfo.NumEvents * 2);
+                    streamInfo.DeletionData = Random.Next(numExistingEvents, streamInfo.NumEvents * 2);
+                    Console.WriteLine($"Stream {stream}: TruncateBefore set to {streamInfo.DeletionData}");
                     break;
                 case DeletionKind.MaxCount:
                     streamInfo.DeletionData = Random.Next(1, streamInfo.NumEvents * 2);
+                    Console.WriteLine($"Stream {stream}: MaxCount set to {streamInfo.DeletionData}");
                     break;
                 case DeletionKind.MaxAge:
                     streamInfo.DeletionData = Random.Next(1, 10);
+                    Console.WriteLine($"Stream {stream}: MaxAge set to {streamInfo.DeletionData}");
                     break;
                 case DeletionKind.SoftDelete:
                     // nothing to set
+                    Console.WriteLine($"Stream {stream}: soft deleted");
                     break;
                 case DeletionKind.TombStone:
                     // nothing to set
+                    Console.WriteLine($"Stream {stream}: tombstoned");
                     break;
             }
 
